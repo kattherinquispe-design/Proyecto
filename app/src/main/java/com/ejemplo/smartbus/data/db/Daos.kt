@@ -60,6 +60,9 @@ interface RoutePointDao {
     @Query("SELECT * FROM route_points ORDER BY routeId, sequence")
     suspend fun getAll(): List<RoutePointEntity>
 
+    @Query("SELECT * FROM route_points WHERE routeId = :routeId ORDER BY sequence")
+    suspend fun getForRoute(routeId: Int): List<RoutePointEntity>
+
     @Query("DELETE FROM route_points WHERE routeId = :routeId")
     suspend fun deleteForRoute(routeId: Int)
 
@@ -79,12 +82,24 @@ interface VehicleDao {
     @Query("SELECT * FROM vehicles ORDER BY id")
     suspend fun getAll(): List<VehicleEntity>
 
+    @Query("SELECT * FROM vehicles WHERE id = :id")
+    suspend fun getById(id: Int): VehicleEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(items: List<VehicleEntity>)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsert(item: VehicleEntity)
 
+    /**
+     * Actualiza la posicion de una unidad simulada.
+     *
+     * El filtro `driverName = ''` es la parte importante: si la unidad
+     * tiene un conductor real asignado, el simulador NO la puede mover.
+     * Sin esto, la posicion del conductor y la del simulador se
+     * pisarian cada pocos segundos y el pasajero veria el vehiculo
+     * saltando de un lado a otro en vez de en tiempo real.
+     */
     @Query(
         """
         UPDATE vehicles
@@ -94,7 +109,7 @@ interface VehicleDao {
             headingDegrees = :headingDegrees,
             gpsAccuracy = :gpsAccuracy,
             lastUpdate = :lastUpdate
-        WHERE id = :vehicleId
+        WHERE id = :vehicleId AND driverName = ''
         """
     )
     suspend fun updatePosition(
@@ -106,6 +121,17 @@ interface VehicleDao {
         gpsAccuracy: Float?,
         lastUpdate: Long
     )
+
+    /**
+     * Suelta la unidad: cuando el conductor termina el servicio, el
+     * vehiculo se elimina de los buses activos para no confundir al
+     * pasajero con un bus fantasma o simulado.
+     */
+    @Query("DELETE FROM vehicles WHERE id = :vehicleId")
+    suspend fun clearLivePosition(vehicleId: Int)
+
+    @Query("DELETE FROM vehicles WHERE isMock = 1 OR driverName = ''")
+    suspend fun deleteSimulatedVehicles()
 
     /**
      * Escribe la posicion real de una unidad que tiene conductor
@@ -196,6 +222,9 @@ interface DriverProfileDao {
 
     @Query("SELECT * FROM driver_profiles WHERE accountId = :accountId")
     suspend fun get(accountId: String): DriverProfileEntity?
+
+    @Query("SELECT * FROM driver_profiles WHERE LOWER(email) = LOWER(:email) LIMIT 1")
+    suspend fun getByEmail(email: String): DriverProfileEntity?
 
     @Query("SELECT COUNT(*) FROM driver_profiles WHERE documentId = :documentId")
     suspend fun countByDocumentId(documentId: String): Int

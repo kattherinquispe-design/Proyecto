@@ -2,6 +2,7 @@ package com.ejemplo.smartbus.navigation
 
 import android.Manifest
 import android.net.Uri
+import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -15,6 +16,13 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
+import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.ui.text.font.FontWeight
+import com.ejemplo.smartbus.ui.theme.SmartBusText
+import com.ejemplo.smartbus.ui.theme.SmartBusTextSecondary
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -36,7 +44,10 @@ import com.ejemplo.smartbus.data.driver.DriverGateResult
 import com.ejemplo.smartbus.data.driver.DriverRepository
 import com.ejemplo.smartbus.data.driver.DriverReviewSimulator
 import com.ejemplo.smartbus.data.driver.DriverValidators
+import com.ejemplo.smartbus.data.driver.FaceDetectionValidator
+import com.ejemplo.smartbus.data.FirebaseRouteRepository
 import com.ejemplo.smartbus.data.RoomTransitRepository
+import com.ejemplo.smartbus.data.RouteRepository
 import com.ejemplo.smartbus.data.model.DriverDocumentType
 import com.ejemplo.smartbus.location.DriverLocationService
 import com.ejemplo.smartbus.ui.components.rememberCameraCapture
@@ -46,6 +57,7 @@ import com.ejemplo.smartbus.ui.screens.DriverHomeScreen
 import com.ejemplo.smartbus.ui.screens.DriverOnboardingScreen
 import com.ejemplo.smartbus.ui.screens.DriverVehicleScreen
 import com.ejemplo.smartbus.ui.screens.VehicleUnit
+import java.io.File
 import kotlinx.coroutines.launch
 
 /**
@@ -94,31 +106,68 @@ fun DriverFlow(
      * una de ellas: en una flota real lo hce el operador, aqui se
      * elige a mano porque no hay backend todavia.
      */
-    val transitUnits = remember(vehiclesSnapshot, routesSnapshot) {
-        vehiclesSnapshot.map { vehicle ->
-            VehicleUnit(
-                id = vehicle.id,
-                code = vehicle.code,
-                routeName = routesSnapshot
-                    .firstOrNull { it.id == vehicle.routeId }
-                    ?.let { "${it.code} - ${it.name}" }
-                    ?: "Sin ruta"
-            )
+    val firebaseRoutes by FirebaseRouteRepository.routes.collectAsState()
+
+    val allRoutes = remember(firebaseRoutes, routesSnapshot) {
+        when {
+            firebaseRoutes.isNotEmpty() -> firebaseRoutes
+            routesSnapshot.isNotEmpty() -> routesSnapshot
+            else -> RouteRepository.routes
+        }
+    }
+
+    val transitUnits = remember(allRoutes, vehiclesSnapshot) {
+        if (allRoutes.isNotEmpty()) {
+            allRoutes.map { route ->
+                VehicleUnit(
+                    id = route.id,
+                    code = route.code,
+                    routeName = "${route.code} - ${route.name}"
+                )
+            }
+        } else {
+            vehiclesSnapshot.map { vehicle ->
+                VehicleUnit(
+                    id = vehicle.id,
+                    code = vehicle.code,
+                    routeName = "Unidad ${vehicle.code}"
+                )
+            }
         }
     }
 
     var screen by remember { mutableStateOf(DriverScreen.HOME) }
+    var checkedCloudProfile by remember(accountId) { mutableStateOf(false) }
 
     val profile by remember(accountId) {
         repository.observeProfile(accountId)
     }.collectAsState(initial = null)
 
     /**
-     * Un conductor que todavia no ha llenado sus datos no pinta nada
-     * en el mapa: primero se registra, y despues ve su ruta.
+     * Si el conductor ya tiene correo en la sesion, primero intentamos
+     * restaurar su perfil de conductor desde la base local o Firestore
+     * para que no tenga que volver a llenar sus datos si se cerro la app.
      */
-    LaunchedEffect(profile) {
-        if (screen == DriverScreen.HOME && profile == null) {
+    LaunchedEffect(accountId, profile) {
+        val existingLocal = repository.getProfile(accountId)
+        if (existingLocal != null) {
+            checkedCloudProfile = true
+            return@LaunchedEffect
+        }
+        if (!checkedCloudProfile) {
+            val sessionEmail = com.ejemplo.smartbus.data.SessionManager.get(context)
+                .session.value?.email.orEmpty().trim()
+            if (sessionEmail.isNotBlank()) {
+                val restored = repository.loginOrRestoreByEmail(sessionEmail, accountId)
+                checkedCloudProfile = true
+                if (restored != null) {
+                    screen = DriverScreen.HOME
+                    return@LaunchedEffect
+                }
+            }
+            checkedCloudProfile = true
+        }
+        if (screen == DriverScreen.HOME && repository.getProfile(accountId) == null) {
             screen = DriverScreen.PROFILE
         }
     }
@@ -151,20 +200,123 @@ fun DriverFlow(
      * Ruta asignada al conductor: es la ruta de la unidad de transito
      * que el conductor eligio como suya. Es lo que ve en el mapa.
      */
-    val assignedRoute = remember(primaryVehicle, vehiclesSnapshot, routesSnapshot) {
+    val assignedRoute = remember(primaryVehicle, allRoutes, vehiclesSnapshot) {
         val transitId = primaryVehicle?.transitVehicleId
             ?: return@remember null
 
-        val unit = vehiclesSnapshot.firstOrNull { it.id == transitId }
-            ?: return@remember null
-
-        routesSnapshot.firstOrNull { it.id == unit.routeId }
+        allRoutes.firstOrNull { it.id == transitId }
+            ?: vehiclesSnapshot.firstOrNull { it.id == transitId }?.let { unit ->
+                allRoutes.firstOrNull { it.id == unit.routeId }
+            }
     }
 
     val isWorking = shift?.isOnline == true
 
     val blockers = remember(profile, primaryVehicle, approvedTypes) {
         DriverValidators.blockReasons(profile, primaryVehicle, approvedTypes)
+    }
+
+    // ============================================================
+    // PERMISOS Y PUESTA EN SERVICIO
+    // ============================================================
+
+    /**
+     * El conductor necesita ubicacion real para que el pasajero lo vea.
+     * Si ya la tiene concedida no se le vuelve a preguntar.
+     */
+    fun hasLocationPermission(): Boolean {
+
+        val fine = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        val coarse = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        return fine || coarse
+    }
+
+    /**
+     * Revisa las reglas y, si todo esta en orden, arranca el GPS que
+     * comparte la posicion con el pasajero.
+     */
+    fun goOnlineNow() {
+        scope.launch {
+            when (val result = repository.goOnline(accountId)) {
+
+                is DriverGateResult.Blocked ->
+                    snackbar.showSnackbar(result.blockers.first().title)
+
+                DriverGateResult.Allowed -> {
+                    DriverLocationService.start(context, accountId)
+                    DriverHomeScreenMessages.online(context)
+                }
+            }
+        }
+    }
+
+    val backgroundLocationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        // Se conceda o no, se arranca: el servicio es de primer plano,
+        // asi que la ubicacion funciona igual con la pantalla encendida.
+        goOnlineNow()
+    }
+
+    val driverLocationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+
+        val granted =
+            permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+
+        if (!granted) {
+            Toast.makeText(
+                context,
+                "Sin ubicacion no podemos mostrar tu vehiculo al pasajero",
+                Toast.LENGTH_LONG
+            ).show()
+            return@rememberLauncherForActivityResult
+        }
+
+        // Android 10+ pide aparte la ubicacion en segundo plano, para
+        // seguir compartiendo con la pantalla apagada.
+        val needsBackground =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.ACCESS_BACKGROUND_LOCATION
+                ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        if (needsBackground) {
+            backgroundLocationLauncher.launch(
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION
+            )
+        } else {
+            goOnlineNow()
+        }
+    }
+
+    /**
+     * Pide ubicacion (y notificaciones para el aviso del servicio) y,
+     * al concederlas, deja al conductor en servicio.
+     */
+    fun requestLocationThenGoOnline() {
+
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions += Manifest.permission.POST_NOTIFICATIONS
+        }
+
+        driverLocationLauncher.launch(permissions.toTypedArray())
     }
 
     /**
@@ -174,6 +326,16 @@ fun DriverFlow(
      */
     fun leaveScreen() {
         screen = DriverScreen.HOME
+    }
+
+    /**
+     * Vuelve al modo pasajero cerrando el servicio de GPS para que el
+     * pasajero deje de ver el vehiculo. El service termina de cerrar el
+     * turno en segundo plano.
+     */
+    fun returnToPassenger() {
+        DriverLocationService.stop(context)
+        onSwitchToPassenger()
     }
 
     Scaffold(
@@ -194,6 +356,18 @@ fun DriverFlow(
                     blockers = blockers,
                     isWorking = isWorking,
                     route = assignedRoute,
+                    availableRoutes = allRoutes,
+                    onSelectRoute = { selectedRoute ->
+                        scope.launch {
+                            if (primaryVehicle == null) {
+                                screen = DriverScreen.VEHICLE
+                                snackbar.showSnackbar("Registra primero tu vehículo y elige la ruta ${selectedRoute.code}")
+                            } else {
+                                repository.assignRoute(accountId, selectedRoute.id)
+                                snackbar.showSnackbar("Ruta asignada: ${selectedRoute.code} - ${selectedRoute.name}")
+                            }
+                        }
+                    },
                     onToggleOnline = {
 
                         if (isWorking) {
@@ -208,55 +382,18 @@ fun DriverFlow(
 
                         } else {
 
-                            val hasFine = ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.ACCESS_FINE_LOCATION
-                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-
-                            val hasCoarse = ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.ACCESS_COARSE_LOCATION
-                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-
-                            if (!hasFine && !hasCoarse) {
-                                Toast.makeText(
-                                    context,
-                                    "Necesitamos tu ubicacion para mostrar el " +
-                                        "vehiculo al pasajero",
-                                    Toast.LENGTH_LONG
-                                ).show()
-                                return@DriverHomeScreen
-                            }
-
-                            scope.launch {
-
-                                when (val result =
-                                    repository.goOnline(accountId)) {
-
-                                    is DriverGateResult.Blocked ->
-                                        scope.launch {
-                                            snackbar.showSnackbar(
-                                                result.blockers.first().title
-                                            )
-                                        }
-
-                                    DriverGateResult.Allowed -> {
-                                        DriverLocationService.start(
-                                            context,
-                                            accountId
-                                        )
-                                        DriverHomeScreenMessages.online(
-                                            context
-                                        )
-                                    }
-                                }
+                            if (!hasLocationPermission()) {
+                                requestLocationThenGoOnline()
+                            } else {
+                                goOnlineNow()
                             }
                         }
                     },
                     onOpenProfile = { screen = DriverScreen.PROFILE },
                     onOpenDocuments = { screen = DriverScreen.DOCUMENTS },
                     onOpenVehicle = { screen = DriverScreen.VEHICLE },
-                    onOpenEarnings = { screen = DriverScreen.EARNINGS }
+                    onOpenEarnings = { screen = DriverScreen.EARNINGS },
+                    onSwitchToPassenger = { returnToPassenger() }
                 )
 
                 DriverScreen.PROFILE -> DriverOnboardingScreen(
@@ -279,7 +416,7 @@ fun DriverFlow(
                         screen = DriverScreen.DOCUMENTS
                         scope.launch {
                             snackbar.showSnackbar(
-                                "Vehiculo guardado. Ahora sube tus documentos."
+                                "Vehiculo y ruta guardados. Ahora completa tus documentos."
                             )
                         }
                     }
@@ -295,8 +432,7 @@ fun DriverFlow(
                         screen = DriverScreen.HOME
                         scope.launch {
                             snackbar.showSnackbar(
-                                "Documentos enviados. Te avisamos cuando " +
-                                    "sean revisados."
+                                "Documentación verificada y respaldada en la base de datos."
                             )
                         }
                     }
@@ -307,17 +443,13 @@ fun DriverFlow(
                     onBack = { leaveScreen() }
                 )
             }
-
-            if (screen == DriverScreen.HOME) {
-
-                SwitchToPassengerBar(onSwitchToPassenger)
-            }
         }
     }
 }
 
 /**
- * Paso de documentos con el selector de archivos de verdad.
+ * Paso de documentos con validacion de imagen y sistema de deteccion
+ * de rostros en vivo para las fotos biometricas del conductor.
  *
  * El archivo se copia al almacenamiento interno y de ahi se guarda
  * solo la ruta: si se guardara la Uri, al reinstalar o al limpiar la
@@ -339,6 +471,7 @@ private fun DocumentsStep(
     var pendingType by remember { mutableStateOf<DriverDocumentType?>(null) }
     var chooseSourceFor by remember { mutableStateOf<DriverDocumentType?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var validationError by remember { mutableStateOf<String?>(null) }
 
     fun onFileReady(path: String?) {
 
@@ -353,42 +486,54 @@ private fun DocumentsStep(
 
         scope.launch {
 
-            if (path.isHttpOrFileUri()) {
-
-                // Viene de la galeria: copiar al almacenamiento interno
-                // antes de guardar la ruta.
-                val copied = DriverDocumentStorage.copyIntoAppStorage(
+            val finalPath = if (path.isHttpOrFileUri()) {
+                // Viene de la galeria: copiar al almacenamiento interno antes de validar
+                DriverDocumentStorage.copyIntoAppStorage(
                     context = context,
                     accountId = accountId,
                     type = type,
                     source = Uri.parse(path)
                 )
-
-                if (copied == null) {
-                    Toast.makeText(
-                        context,
-                        "No se pudo leer el archivo. Intenta con una foto.",
-                        Toast.LENGTH_LONG
-                    ).show()
-                    busy = false
-                    return@launch
-                }
-
-                repository.uploadDocument(
-                    accountId = accountId,
-                    type = type,
-                    filePath = copied
-                )
-
             } else {
-
-                // Viene de la camara: ya es un archivo del telefono.
-                repository.uploadDocument(
-                    accountId = accountId,
-                    type = type,
-                    filePath = path
-                )
+                path
             }
+
+            if (finalPath == null) {
+                Toast.makeText(
+                    context,
+                    "No se pudo leer el archivo. Intenta tomar la foto nuevamente.",
+                    Toast.LENGTH_LONG
+                ).show()
+                busy = false
+                return@launch
+            }
+
+            // Validar documento y deteccion de rostro en vivo (si es foto biometrica)
+            val validation = FaceDetectionValidator.validateCapturedPhoto(
+                filePath = finalPath,
+                type = type
+            )
+
+            if (!validation.valid) {
+                runCatching { File(finalPath).delete() }
+                validationError = validation.message
+                busy = false
+                return@launch
+            }
+
+            repository.uploadDocument(
+                accountId = accountId,
+                type = type,
+                filePath = finalPath,
+                note = validation.message,
+                approved = true
+            )
+
+            Toast.makeText(
+                context,
+                "✅ ${validation.message}",
+                Toast.LENGTH_SHORT
+            ).show()
 
             busy = false
         }
@@ -425,54 +570,108 @@ private fun DocumentsStep(
                     repository.deleteDocument(accountId, type)
                 }
             },
-            onBack = onBack
+            onBack = onBack,
+            onFinish = onFinish
         )
 
-        // Al tocar "Subir", se pregunta de donde: foto con la camara
-        // o un archivo de la galeria. Para un DNI lo natural es la
-        // camara; para un documento ya escaneado, la galeria.
+        validationError?.let { errorMsg ->
+            AlertDialog(
+                onDismissRequest = { validationError = null },
+                title = {
+                    Text(
+                        "⚠️ Verificación de seguridad rechazada",
+                        fontWeight = FontWeight.Bold
+                    )
+                },
+                text = {
+                    Text(
+                        text = errorMsg,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = SmartBusText
+                    )
+                },
+                confirmButton = {
+                    Button(onClick = { validationError = null }) {
+                        Text("Entendido, volver a intentar")
+                    }
+                }
+            )
+        }
+
+        // Al tocar "Subir", si requiere rostro en vivo solo permite camara en tiempo real.
         chooseSourceFor?.let { type ->
+            val requiresLiveFace = FaceDetectionValidator.requiresLiveFaceDetection(type)
 
             AlertDialog(
                 onDismissRequest = { chooseSourceFor = null },
-                title = { Text("Agregar ${type.title.lowercase()}") },
+                title = {
+                    Text(
+                        if (requiresLiveFace) {
+                            "🔒 Detección de rostro en vivo: ${type.title}"
+                        } else {
+                            "Captura de ${type.title}"
+                        },
+                        fontWeight = FontWeight.Bold
+                    )
+                },
                 text = {
-                    Column {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(
-                            text = "La foto debe verse completa y legible.",
-                            style = MaterialTheme.typography.bodySmall
+                            text = if (requiresLiveFace) {
+                                "Por seguridad, esta verificación biométrica exige tomar una foto de tu rostro en vivo con la cámara (se bloqueará si no se detecta un rostro humano claro)."
+                            } else {
+                                "Toma una foto nítida y legible del documento para guardarlo en tu cuenta verificada."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SmartBusTextSecondary
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = type.explanation,
-                            style = MaterialTheme.typography.bodySmall
+                            text = "Detalle: " + type.explanation,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SmartBusText
                         )
                     }
                 },
                 confirmButton = {
-                    Row {
-                        TextButton(
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Button(
                             onClick = {
                                 pendingType = type
                                 chooseSourceFor = null
                                 capture()
-                            }
+                            },
+                            modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("Camara")
+                            Text(
+                                if (requiresLiveFace) {
+                                    "📷 Tomar foto de rostro en vivo (Cámara)"
+                                } else {
+                                    "📷 Tomar foto en tiempo real (Cámara)"
+                                }
+                            )
                         }
-                        TextButton(
-                            onClick = {
-                                pendingType = type
-                                chooseSourceFor = null
-                                picker.launch("image/*")
+                        if (!requiresLiveFace) {
+                            OutlinedButton(
+                                onClick = {
+                                    pendingType = type
+                                    chooseSourceFor = null
+                                    picker.launch("image/*")
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("📁 Seleccionar documento / Galería")
                             }
-                        ) {
-                            Text("Galeria")
                         }
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { chooseSourceFor = null }) {
+                    TextButton(
+                        onClick = { chooseSourceFor = null },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
                         Text("Cancelar")
                     }
                 }
@@ -482,7 +681,7 @@ private fun DocumentsStep(
         if (busy) {
 
             Text(
-                text = "Guardando documento...",
+                text = "Analizando y verificando documento...",
                 modifier = Modifier.padding(16.dp)
             )
         }
@@ -523,20 +722,6 @@ private fun DebugReviewBar(onApprove: () -> Unit) {
 
 private fun String.isHttpOrFileUri(): Boolean =
     startsWith("content://") || startsWith("file://")
-
-@Composable
-private fun SwitchToPassengerBar(onSwitch: () -> Unit) {
-
-    Column(modifier = Modifier.padding(bottom = 12.dp)) {
-
-        TextButton(
-            onClick = onSwitch,
-            modifier = Modifier.padding(horizontal = 20.dp)
-        ) {
-            Text("Volver al modo pasajero")
-        }
-    }
-}
 
 private object DriverHomeScreenMessages {
 

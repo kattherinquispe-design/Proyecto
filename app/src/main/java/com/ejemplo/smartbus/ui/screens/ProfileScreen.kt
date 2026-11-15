@@ -307,6 +307,13 @@ fun ProfileScreen(
                     Modifier.height(18.dp)
             )
 
+            DriverModeButton(onClick = onBecomeDriverClick)
+
+            Spacer(
+                modifier =
+                    Modifier.height(18.dp)
+            )
+
             Text(
                 text = "Resumen",
                 style =
@@ -381,6 +388,80 @@ fun ProfileScreen(
                 title = "Ayuda",
                 subtitle = "Preguntas frecuentes",
                 onClick = onHelpClick
+            )
+        }
+    }
+}
+
+/**
+ * Acceso al modo conductor.
+ *
+ * Es el boton mas visible del perfil a proposito: quien quiera
+ * trabajar tiene que encontrarlo sin dudar. El amarillo de la marca
+ * lo separa del resto de tarjetas blancas.
+ */
+@Composable
+private fun DriverModeButton(onClick: () -> Unit) {
+
+    Card(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = SmartBusYellow
+        )
+    ) {
+
+        Row(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+
+            Box(
+                modifier =
+                    Modifier
+                        .size(50.dp)
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.30f)),
+                contentAlignment = Alignment.Center
+            ) {
+
+                Icon(
+                    imageVector = Icons.Default.DirectionsCar,
+                    contentDescription = null,
+                    tint = SmartBusText,
+                    modifier = Modifier.size(30.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(14.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+
+                Text(
+                    text = "Modo conductor",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = SmartBusText
+                )
+
+                Text(
+                    text = "Registra tu vehículo y sal a trabajar",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = SmartBusText.copy(alpha = 0.75f)
+                )
+            }
+
+            Icon(
+                imageVector = Icons.Default.ArrowForwardIos,
+                contentDescription = null,
+                tint = SmartBusText,
+                modifier = Modifier.size(16.dp)
             )
         }
     }

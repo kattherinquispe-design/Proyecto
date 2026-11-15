@@ -53,9 +53,52 @@ object DriverRequirements {
     val all: List<DriverDocumentType> = required + recommended
 
     /**
-     * Un bloque de cada categoria, en el orden en que se le pide al
-     * conductor para que la historia tenga sentido.
+     * Empresas de transporte autorizadas en la plataforma.
+     *
+     * Para asegurar que solo ingrese personal de companias confiables,
+     * el conductor debe elegir una de estas y escribir el codigo de
+     * operador que le entrega la empresa. Si el codigo no coincide, el
+     * registro no avanza: nadie se auto-adscribe.
+     *
+     * En produccion esta lista la entrega el backend (convenios firmados
+     * con cada empresa) y se puede desactivar una empresa en caliente.
      */
+    val companies: List<TrustedCompany> = listOf(
+        TrustedCompany(
+            name = "Consorcio Lima Norte",
+            code = "CLN",
+            operatorCode = "CLN-2026"
+        ),
+        TrustedCompany(
+            name = "Transportes Arequipa Express",
+            code = "TAX",
+            operatorCode = "TAX-2026"
+        ),
+        TrustedCompany(
+            name = "Corporacion El Rápido",
+            code = "CER",
+            operatorCode = "CER-2026"
+        ),
+        TrustedCompany(
+            name = "Metropolitano Sur",
+            code = "MTS",
+            operatorCode = "MTS-2026"
+        ),
+        TrustedCompany(
+            name = "Rutas del Pacífico",
+            code = "RDP",
+            operatorCode = "RDP-2026"
+        )
+    )
+
+    fun findCompany(code: String): TrustedCompany? =
+        companies.firstOrNull { it.code.equals(code.trim(), ignoreCase = true) }
+
+    fun findCompanyByOperatorCode(operatorCode: String): TrustedCompany? =
+        companies.firstOrNull {
+            it.operatorCode.equals(operatorCode.trim(), ignoreCase = true)
+        }
+
     val steps: List<DriverStep> = listOf(
         DriverStep(
             title = "Quien eres",
@@ -89,6 +132,16 @@ object DriverRequirements {
         )
     )
 }
+
+/**
+ * Una empresa de transporte con convenio. El [operatorCode] es el
+ * codigo interno que la empresa le entrega a su personal.
+ */
+data class TrustedCompany(
+    val name: String,
+    val code: String,
+    val operatorCode: String
+)
 
 data class DriverStep(
     val title: String,
@@ -263,6 +316,21 @@ object DriverValidators {
             )
         }
 
+        // Solo personal de empresas con convenio. El codigo se elige
+        // del catalogo y ademas tiene que coincidir con el de operador:
+        // asi no basta con inventarse el nombre de una empresa real.
+        if (profile.companyCode.isBlank()) {
+            reasons += DriverBlocker(
+                "Falta tu empresa",
+                "Elige la empresa de transporte a la que perteneces."
+            )
+        } else if (DriverRequirements.findCompany(profile.companyCode) == null) {
+            reasons += DriverBlocker(
+                "Empresa no autorizada",
+                "La empresa seleccionada no tiene convenio con SmartBus."
+            )
+        }
+
         if (!profile.phoneVerified) {
             reasons += DriverBlocker(
                 "Telefono sin verificar",
@@ -306,6 +374,16 @@ object DriverValidators {
                 reasons += DriverBlocker(
                     "Inspeccion vehicular vencida",
                     "Renueva la tarjeta de inspeccion del vehiculo."
+                )
+            }
+            // Sin unidad no hay ruta, y sin ruta no se puede verificar
+            // que el conductor siga el recorrido asignado: podria estar
+            // yendo a su casa y el pasajero seguiria viendolo "en ruta".
+            if (vehicle.transitVehicleId == null) {
+                reasons += DriverBlocker(
+                    "Sin ruta asignada",
+                    "Asignate a una unidad de transporte: asi verificamos " +
+                        "que tu ubicacion siga el recorrido de tu ruta."
                 )
             }
         }

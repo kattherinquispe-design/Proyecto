@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -12,12 +13,15 @@ import android.content.pm.ServiceInfo
 import android.location.Location
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.ejemplo.smartbus.MainActivity
 import com.ejemplo.smartbus.data.SessionManager
 import com.ejemplo.smartbus.data.driver.DriverRepository
+import com.ejemplo.smartbus.data.model.GeoPoint
 import com.ejemplo.smartbus.data.model.UserRole
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
@@ -30,6 +34,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlin.math.cos
+import kotlin.math.sqrt
 
 /**
  * Comparte la ubicacion del conductor mientras esta online.
@@ -55,6 +61,20 @@ class DriverLocationService : Service() {
 
     private var accountId: String? = null
     private var tracking = false
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * Trazado de la ruta asignada. Se carga al empezar y sirve para
+     * vigilar que el conductor no se salga del recorrido.
+     */
+    @Volatile
+    private var routePoints: List<GeoPoint> = emptyList()
+
+    /** Momento en que empezo el desvio actual, 0 si va por la ruta. */
+    private var deviationStartedAt = 0L
+
+    /** Evita disparar dos veces la parada por desvio. */
+    private var deviationHandled = false
 
     override fun onCreate() {
 
@@ -79,19 +99,36 @@ class DriverLocationService : Service() {
 
             ACTION_START -> {
                 accountId = intent.getStringExtra(EXTRA_ACCOUNT_ID)
+                    ?: SessionManager.get(this).session.value?.storageKey
                 startTracking()
             }
 
             ACTION_STOP -> {
-                stopTracking()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
+                if (accountId == null) {
+                    accountId = intent?.getStringExtra(EXTRA_ACCOUNT_ID)
+                        ?: SessionManager.get(this).session.value?.storageKey
+                }
+                shutdown()
+            }
+
+            null -> {
+                // Reiniciado automaticamente por Android en segundo plano (START_STICKY)
+                accountId = SessionManager.get(this).session.value?.storageKey
+                startTracking()
             }
         }
 
         // Si el sistema mata el servicio, se reinicia solo con la
         // ultima cuenta conocida para no perder el viaje.
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        val currentId = accountId ?: SessionManager.get(this).session.value?.storageKey
+        if (tracking && currentId != null) {
+            start(applicationContext, currentId)
+        }
     }
 
     // =====================================================
@@ -134,7 +171,25 @@ class DriverLocationService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
+        acquireWakeLock()
+
         tracking = true
+        deviationStartedAt = 0L
+        deviationHandled = false
+
+        // La ruta asignada se lee en segundo plano para no bloquear el
+        // arranque del servicio. Sin ruta no se puede vigilar el desvio.
+        val currentAccount = accountId
+        if (currentAccount != null) {
+            scope.launch {
+                routePoints = try {
+                    driverRepository.getAssignedRoutePoints(currentAccount)
+                } catch (exception: Exception) {
+                    Log.w(TAG, "No se pudo leer la ruta: ${exception.message}")
+                    emptyList()
+                }
+            }
+        }
 
         val request =
             LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, UPDATE_INTERVAL_MS)
@@ -191,6 +246,14 @@ class DriverLocationService : Service() {
 
             Log.w(TAG, "Se descarto una ubicacion simulada")
 
+            return
+        }
+
+        // Vigilancia del recorrido: si el conductor se aleja de su ruta
+        // mas de lo permitido y no vuelve en el tiempo maximo, se deja
+        // de publicar su ubicacion. Asi el pasajero deja de ver un
+        // vehiculo "en ruta" que en realidad esta yendo a otro lado.
+        if (checkRouteDeviation(location)) {
             return
         }
 
@@ -254,16 +317,196 @@ class DriverLocationService : Service() {
         return false
     }
 
+    /**
+     * Comprueba si el conductor sigue dentro de su ruta.
+     *
+     * Devuelve true si el servicio ya se detuvo por desvio (y entonces
+     * la posicion no debe publicarse). Mientras esta dentro de la
+     * tolerancia, reinicia el contador.
+     */
+    private fun checkRouteDeviation(location: Location): Boolean {
+
+        if (deviationHandled) {
+            return true
+        }
+
+        val points = routePoints
+
+        // Sin ruta cargada no hay nada que vigilar.
+        if (points.size < 2) {
+            return false
+        }
+
+        val distance = distanceToRouteMeters(
+            location.latitude,
+            location.longitude,
+            points
+        )
+
+        if (distance <= DEVIATION_TOLERANCE_M) {
+            deviationStartedAt = 0L
+            return false
+        }
+
+        val now = System.currentTimeMillis()
+
+        if (deviationStartedAt == 0L) {
+            deviationStartedAt = now
+            Log.w(TAG, "Desvio detectado: ${distance.toInt()} m de la ruta")
+            return false
+        }
+
+        if (now - deviationStartedAt < DEVIATION_TIMEOUT_MS) {
+            return false
+        }
+
+        deviationHandled = true
+        handleDeviationStop()
+        return true
+    }
+
+    /**
+     * Cierra el servicio por desvio prolongado: el conductor deja de
+     * trabajar y su vehiculo desaparece del mapa del pasajero.
+     */
+    private fun handleDeviationStop() {
+
+        Log.w(
+            TAG,
+            "Desvio de mas de ${DEVIATION_TIMEOUT_MS / 60_000} min: " +
+                "se deja de compartir la ubicacion"
+        )
+
+        shutdown()
+    }
+
+    /**
+     * Apaga el servicio con orden.
+     *
+     * Primero cierra el turno (para que el vehiculo deje de estar
+     * asociado al conductor) y solo despues se retira. Se hace en una
+     * corrutina para no bloquear el hilo principal, pero sin matar el
+     * servicio antes de terminar.
+     */
+    private fun shutdown() {
+
+        val id = accountId
+
+        if (id == null) {
+            stopTracking()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        scope.launch {
+            try {
+                driverRepository.goOffline(id)
+            } catch (exception: Exception) {
+                Log.w(TAG, "No se pudo cerrar el turno: ${exception.message}")
+            } finally {
+                stopTracking()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    /**
+     * Distancia minima, en metros, del punto a cualquiera de los
+     * segmentos de la ruta.
+     *
+     * Se proyecta sobre un plano local (equirectangular): para tramos
+     * de una ciudad el error es de centimetros y evita cargar una
+     * libreria de geometria solo para esto.
+     */
+    private fun distanceToRouteMeters(
+        latitude: Double,
+        longitude: Double,
+        points: List<GeoPoint>
+    ): Float {
+
+        if (points.size < 2) {
+            return 0f
+        }
+
+        val metersPerDegLat = 111_320.0
+        val metersPerDegLng =
+            111_320.0 * cos(Math.toRadians(latitude))
+
+        var best = Float.MAX_VALUE
+
+        for (index in 0 until points.size - 1) {
+
+            val a = points[index]
+            val b = points[index + 1]
+
+            val ax = (a.longitude - longitude) * metersPerDegLng
+            val ay = (a.latitude - latitude) * metersPerDegLat
+            val bx = (b.longitude - longitude) * metersPerDegLng
+            val by = (b.latitude - latitude) * metersPerDegLat
+
+            val dx = bx - ax
+            val dy = by - ay
+            val lengthSquared = dx * dx + dy * dy
+
+            val t = if (lengthSquared <= 0.0) {
+                0.0
+            } else {
+                ((-ax * dx - ay * dy) / lengthSquared).coerceIn(0.0, 1.0)
+            }
+
+            val px = ax + t * dx
+            val py = ay + t * dy
+
+            val distance = sqrt(px * px + py * py).toFloat()
+
+            if (distance < best) {
+                best = distance
+            }
+        }
+
+        return best
+    }
+
+    private fun acquireWakeLock() {
+        try {
+            if (wakeLock == null) {
+                val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                wakeLock = powerManager?.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "SmartBus:DriverGpsWakeLock"
+                )?.apply {
+                    setReferenceCounted(false)
+                }
+            }
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(8 * 60 * 60 * 1000L) // Hasta 8 horas de turno continuo
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudo adquirir WakeLock: ${e.message}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     private fun stopTracking() {
 
-        if (::fusedLocationClient.isInitialized && ::locationCallback.isInitialized) {
-            try {
+        if (::fusedLocationClient.isInitialized && ::locationCallback.isInitialized) {            try {
                 fusedLocationClient.removeLocationUpdates(locationCallback)
             } catch (exception: SecurityException) {
                 Log.w(TAG, "No se pudo quitar el GPS: ${exception.message}")
             }
         }
 
+        releaseWakeLock()
         tracking = false
     }
 
@@ -305,14 +548,26 @@ class DriverLocationService : Service() {
             ?.createNotificationChannel(channel)
     }
 
-    private fun createPersistentNotification(): Notification =
-        NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Estas en servicio")
-            .setContentText("El pasajero puede ver donde vas")
+    private fun createPersistentNotification(): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        } else {
+            PendingIntent.FLAG_UPDATE_CURRENT
+        }
+        val pendingIntent = PendingIntent.getActivity(this, 2001, openIntent, flags)
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("🚌 MistiGo Conductor · En servicio")
+            .setContentText("Transmitiendo ubicación de tu ruta en segundo plano")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -335,6 +590,20 @@ class DriverLocationService : Service() {
 
         /** Un fix peor que esto no se muestra: seria mentir. */
         private const val MAX_ACCEPTED_ACCURACY_M = 100f
+
+        /**
+         * Que tan lejos de la ruta se tolera antes de considerar que el
+         * conductor se desvio. Cubre el error normal del GPS y las
+         * vias paralelas, pero no un viaje a otro distrito.
+         */
+        private const val DEVIATION_TOLERANCE_M = 350f
+
+        /**
+         * Tiempo que puede estar fuera de ruta antes de dejar de
+         * compartir la ubicacion. Veinte minutos permiten una vuelta
+         * larga o un desvio puntual sin castigar al conductor.
+         */
+        private const val DEVIATION_TIMEOUT_MS = 20 * 60 * 1000L
 
         const val ACTION_START = "SMARTBUS_DRIVER_START"
         const val ACTION_STOP = "SMARTBUS_DRIVER_STOP"

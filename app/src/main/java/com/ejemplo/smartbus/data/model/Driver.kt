@@ -205,9 +205,20 @@ enum class DriverDocumentStatus {
  */
 data class DriverProfile(
     val accountId: String,
+    val email: String = "",
     val fullName: String,
     val documentId: String,
     val documentType: String,
+    /**
+     * Empresa o consorcio de transporte al que pertenece el conductor.
+     *
+     * Solo se admite una compania de la lista de confianza (ver
+     * DriverRequirements.companies): asi la plataforma no se llena de
+     * conductores sueltos sin respaldo, y el pasajero sabe que el
+     * vehiculo pertenece a un operador real.
+     */
+    val companyName: String = "",
+    val companyCode: String = "",
     val birthDate: String? = null,
     val phone: String = "",
     val phoneVerified: Boolean = false,
@@ -226,6 +237,8 @@ data class DriverProfile(
     val isComplete: Boolean
         get() = fullName.isNotBlank() &&
             documentId.isNotBlank() &&
+            companyName.isNotBlank() &&
+            companyCode.isNotBlank() &&
             phone.isNotBlank() &&
             licenseNumber.isNotBlank() &&
             emergencyContactName.isNotBlank() &&

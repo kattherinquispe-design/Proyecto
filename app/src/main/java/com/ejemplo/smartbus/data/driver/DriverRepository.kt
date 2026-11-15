@@ -16,9 +16,15 @@ import com.ejemplo.smartbus.data.model.DriverShift
 import com.ejemplo.smartbus.data.model.DriverTrip
 import com.ejemplo.smartbus.data.model.DriverVehicle
 import com.ejemplo.smartbus.data.model.DriverVerificationStatus
+import com.ejemplo.smartbus.data.model.GeoPoint
+import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.SetOptions
 import java.security.SecureRandom
+import kotlin.coroutines.resume
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
  * Todo lo que el conductor registra y el estado en el que esta.
@@ -49,6 +55,7 @@ class DriverRepository(
     private val shiftDao = db.driverShiftDao()
     private val tripDao = db.driverTripDao()
     private val transitVehicleDao = db.vehicleDao()
+    private val routePointDao = db.routePointDao()
 
     private companion object {
         const val TAG = "SmartBusDriverRepo"
@@ -85,9 +92,307 @@ class DriverRepository(
             else -> profile.status
         }
 
-        profileDao.upsert(
-            profile.copy(status = nextStatus).toEntity()
+        val updated = profile.copy(
+            email = profile.email.trim().lowercase(),
+            status = nextStatus
         )
+
+        profileDao.upsert(updated.toEntity())
+        refreshVerificationStatus(updated.accountId)
+        syncDriverToFirestore(updated.accountId)
+    }
+
+    private fun firestoreDocId(email: String, accountId: String): String {
+        val clean = email.trim().lowercase()
+        return if (clean.isNotBlank()) {
+            clean.replace("@", "_").replace(".", "_")
+        } else {
+            accountId.ifBlank { "conductor" }
+        }
+    }
+
+    /**
+     * Sincroniza todos los datos del conductor (incluyendo su correo,
+     * vehiculo, ruta de trabajo y estado/notas de documentos) con la coleccion 'conductores'
+     * de Firebase Firestore para que queden respaldados y pueda iniciar
+     * solo con su correo cuando vuelva a abrir la app.
+     */
+    private suspend fun syncDriverToFirestore(accountId: String) {
+        try {
+            val profile = getProfile(accountId) ?: return
+            val primaryVehicle = getPrimaryVehicle(accountId)
+            val docs = getDocuments(accountId)
+            val approvedTypes = docs.filter { it.satisfied }.map { it.type.name }
+            val uploadedTypes = docs.map { it.type.name }
+            val documentsNotes = docs.associate { it.type.name to it.note }
+
+            val cleanEmail = profile.email.trim().lowercase()
+            val docId = firestoreDocId(cleanEmail, accountId)
+
+            val data = hashMapOf<String, Any?>(
+                "accountId" to profile.accountId,
+                "correo" to cleanEmail,
+                "email" to cleanEmail,
+                "nombre" to profile.fullName,
+                "fullName" to profile.fullName,
+                "documentId" to profile.documentId,
+                "documentType" to profile.documentType,
+                "companyName" to profile.companyName,
+                "companyCode" to profile.companyCode,
+                "birthDate" to (profile.birthDate ?: ""),
+                "phone" to profile.phone,
+                "phoneVerified" to profile.phoneVerified,
+                "licenseNumber" to profile.licenseNumber,
+                "licenseClass" to profile.licenseClass,
+                "licenseExpiresAt" to (profile.licenseExpiresAt ?: 0L),
+                "emergencyContactName" to profile.emergencyContactName,
+                "emergencyContactPhone" to profile.emergencyContactPhone,
+                "status" to profile.status.name,
+                "statusReason" to profile.statusReason,
+                "approvedDocuments" to approvedTypes,
+                "uploadedDocuments" to uploadedTypes,
+                "documentsNotes" to documentsNotes,
+                "requirementsComplete" to DriverValidators.canGoOnline(
+                    profile = profile,
+                    vehicle = primaryVehicle,
+                    approvedTypes = docs.filter { it.satisfied }.map { it.type }.toSet()
+                ),
+                "updatedAt" to System.currentTimeMillis()
+            )
+
+            if (primaryVehicle != null) {
+                data["vehiclePlate"] = primaryVehicle.plate
+                data["vehicleBrand"] = primaryVehicle.brand
+                data["vehicleModel"] = primaryVehicle.model
+                data["vehicleYear"] = primaryVehicle.year
+                data["vehicleColor"] = primaryVehicle.color
+                data["vehicleCapacity"] = primaryVehicle.capacity
+                data["vehicleSoatExpiresAt"] = primaryVehicle.soatExpiresAt ?: 0L
+                data["vehicleInspectionExpiresAt"] = primaryVehicle.inspectionExpiresAt ?: 0L
+                data["transitVehicleId"] = primaryVehicle.transitVehicleId ?: 0
+                data["routeId"] = primaryVehicle.transitVehicleId ?: 0
+            }
+
+            FirebaseFirestore.getInstance()
+                .collection("conductores")
+                .document(docId)
+                .set(data, SetOptions.merge())
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudo sincronizar conductor en Firestore: ${e.message}")
+        }
+    }
+
+    /**
+     * Permite a un conductor ya registrado iniciar o recuperar su perfil,
+     * vehiculo, ruta y documentos ingresando unicamente su correo electronico,
+     * buscando primero en Room local y complementando con Firebase Firestore ('conductores').
+     */
+    suspend fun loginOrRestoreByEmail(
+        email: String,
+        targetAccountId: String
+    ): DriverProfile? {
+        val cleanEmail = email.trim().lowercase()
+        if (cleanEmail.isBlank()) return null
+
+        val effectiveAccountId = targetAccountId.ifBlank { "email_$cleanEmail" }
+
+        // 1. Buscar primero en Room local por correo o por accountId basado en correo
+        val localEntity = profileDao.getByEmail(cleanEmail)
+            ?: profileDao.get("email_$cleanEmail")
+            ?: profileDao.get(effectiveAccountId)?.takeIf {
+                it.email.equals(cleanEmail, ignoreCase = true) || it.email.isBlank()
+            }
+
+        if (localEntity != null) {
+            val sourceAccountId = localEntity.accountId
+            val updatedEntity = localEntity.copy(
+                accountId = effectiveAccountId,
+                email = cleanEmail
+            )
+
+            if (sourceAccountId != effectiveAccountId) {
+                // Copiar vehiculos y documentos al accountId actual
+                val oldVehicles = vehicleDao.getForAccount(sourceAccountId)
+                val oldDocs = documentDao.getForAccount(sourceAccountId)
+                profileDao.delete(sourceAccountId)
+                profileDao.upsert(updatedEntity)
+                oldVehicles.forEach { v ->
+                    vehicleDao.delete(v.id)
+                    vehicleDao.upsert(v.copy(id = 0, accountId = effectiveAccountId))
+                }
+                oldDocs.forEach { d ->
+                    documentDao.upsert(d.copy(id = 0, accountId = effectiveAccountId))
+                }
+            } else if (localEntity.email != cleanEmail) {
+                profileDao.upsert(updatedEntity)
+            }
+
+            // Si en local faltan vehiculo o documentos que ya estaban en Firestore, restaurarlos tambien
+            val localVehicles = vehicleDao.getForAccount(effectiveAccountId)
+            val localApproved = getApprovedDocumentTypes(effectiveAccountId)
+            if (localVehicles.isEmpty() || localApproved.size < DriverRequirements.required.size) {
+                val cloudDoc = fetchDriverDocFromFirestore(cleanEmail, effectiveAccountId)
+                if (cloudDoc != null) {
+                    restoreVehicleAndDocsFromSnapshot(cloudDoc, effectiveAccountId, cleanEmail, updatedEntity.toModel().status)
+                }
+            }
+
+            refreshVerificationStatus(effectiveAccountId)
+            syncDriverToFirestore(effectiveAccountId)
+            return getProfile(effectiveAccountId) ?: updatedEntity.toModel()
+        }
+
+        // 2. Si no estaba en Room local (por ejemplo tras reinstalar o cerrar sesion),
+        // buscar en Firebase Firestore coleccion 'conductores'
+        val snapshot = fetchDriverDocFromFirestore(cleanEmail, effectiveAccountId)
+            ?: return null
+
+        val docIdNumber = snapshot.getString("documentId").orEmpty()
+        val fullName = snapshot.getString("fullName")
+            ?: snapshot.getString("nombre")
+            ?: return null
+
+        if (docIdNumber.isBlank()) return null
+
+        val statusStr = snapshot.getString("status") ?: DriverVerificationStatus.PENDING_REVIEW.name
+        val restoredProfile = DriverProfile(
+            accountId = effectiveAccountId,
+            email = cleanEmail,
+            fullName = fullName,
+            documentId = docIdNumber,
+            documentType = snapshot.getString("documentType") ?: "DNI",
+            companyName = snapshot.getString("companyName").orEmpty(),
+            companyCode = snapshot.getString("companyCode").orEmpty(),
+            birthDate = snapshot.getString("birthDate")?.ifBlank { null },
+            phone = snapshot.getString("phone").orEmpty(),
+            phoneVerified = snapshot.getBoolean("phoneVerified") ?: true,
+            licenseNumber = snapshot.getString("licenseNumber").orEmpty(),
+            licenseClass = snapshot.getString("licenseClass").orEmpty(),
+            licenseExpiresAt = snapshot.getLong("licenseExpiresAt")?.takeIf { it > 0L },
+            emergencyContactName = snapshot.getString("emergencyContactName").orEmpty(),
+            emergencyContactPhone = snapshot.getString("emergencyContactPhone").orEmpty(),
+            status = runCatching { DriverVerificationStatus.valueOf(statusStr) }
+                .getOrDefault(DriverVerificationStatus.PENDING_REVIEW),
+            statusReason = snapshot.getString("statusReason").orEmpty()
+        )
+
+        runCatching {
+            profileDao.upsert(restoredProfile.toEntity())
+        }
+
+        restoreVehicleAndDocsFromSnapshot(snapshot, effectiveAccountId, cleanEmail, restoredProfile.status)
+
+        refreshVerificationStatus(effectiveAccountId)
+        return getProfile(effectiveAccountId) ?: restoredProfile
+    }
+
+    private suspend fun restoreVehicleAndDocsFromSnapshot(
+        snapshot: DocumentSnapshot,
+        effectiveAccountId: String,
+        cleanEmail: String,
+        fallbackStatus: DriverVerificationStatus
+    ) {
+        val plate = snapshot.getString("vehiclePlate").orEmpty().trim().uppercase()
+        if (plate.isNotBlank()) {
+            val existingVehicles = vehicleDao.getForAccount(effectiveAccountId)
+            val defaultSoat = System.currentTimeMillis() + 365L * 24L * 60L * 60L * 1000L
+            val soatExp = snapshot.getLong("vehicleSoatExpiresAt")?.takeIf { it > 0L } ?: defaultSoat
+            val inspExp = snapshot.getLong("vehicleInspectionExpiresAt")?.takeIf { it > 0L }
+            val transitId = (snapshot.getLong("transitVehicleId") ?: snapshot.getLong("routeId"))
+                ?.toInt()?.takeIf { it > 0 }
+            if (existingVehicles.none { it.plate.equals(plate, ignoreCase = true) }) {
+                runCatching {
+                    saveVehicle(
+                        DriverVehicle(
+                            accountId = effectiveAccountId,
+                            plate = plate,
+                            brand = snapshot.getString("vehicleBrand").orEmpty().ifBlank { "Bus" },
+                            model = snapshot.getString("vehicleModel").orEmpty().ifBlank { "Urbano" },
+                            year = snapshot.getLong("vehicleYear")?.toInt() ?: 2022,
+                            color = snapshot.getString("vehicleColor").orEmpty().ifBlank { "Blanco" },
+                            plateCount = lastDigitsOf(plate),
+                            capacity = snapshot.getLong("vehicleCapacity")?.toInt() ?: 30,
+                            isPrimary = true,
+                            soatExpiresAt = soatExp,
+                            inspectionExpiresAt = inspExp,
+                            status = fallbackStatus,
+                            transitVehicleId = transitId
+                        )
+                    )
+                }
+            }
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        val approvedList = (snapshot.get("approvedDocuments") as? List<String>).orEmpty()
+        @Suppress("UNCHECKED_CAST")
+        val uploadedList = (snapshot.get("uploadedDocuments") as? List<String>).orEmpty()
+        @Suppress("UNCHECKED_CAST")
+        val notesMap = (snapshot.get("documentsNotes") as? Map<String, String>).orEmpty()
+        val allTypes = (approvedList + uploadedList).distinct()
+
+        val existingDocsByType = documentDao.getForAccount(effectiveAccountId).associateBy { it.type }
+
+        allTypes.forEach { typeName ->
+            val docType = runCatching { DriverDocumentType.valueOf(typeName) }.getOrNull()
+            if (docType != null) {
+                val isApproved = typeName in approvedList ||
+                    fallbackStatus == DriverVerificationStatus.VERIFIED
+                val existingDoc = existingDocsByType[docType.name]
+                if (existingDoc == null || (isApproved && existingDoc.status != DriverDocumentStatus.APPROVED.name)) {
+                    documentDao.upsert(
+                        DriverDocumentEntity(
+                            id = existingDoc?.id ?: 0L,
+                            accountId = effectiveAccountId,
+                            type = docType.name,
+                            filePath = existingDoc?.filePath ?: "cloud://conductores/$cleanEmail/${docType.name}",
+                            status = if (isApproved) {
+                                DriverDocumentStatus.APPROVED.name
+                            } else {
+                                DriverDocumentStatus.UPLOADED.name
+                            },
+                            note = notesMap[docType.name] ?: existingDoc?.note ?: "Verificado y respaldado en la nube",
+                            expiresAt = existingDoc?.expiresAt,
+                            uploadedAt = existingDoc?.uploadedAt ?: System.currentTimeMillis(),
+                            reviewedAt = if (isApproved) System.currentTimeMillis() else null
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun fetchDriverDocFromFirestore(
+        cleanEmail: String,
+        accountId: String
+    ): DocumentSnapshot? = suspendCancellableCoroutine { cont ->
+        try {
+            val firestore = FirebaseFirestore.getInstance()
+            val docId = firestoreDocId(cleanEmail, accountId)
+            firestore.collection("conductores").document(docId).get()
+                .addOnSuccessListener { doc ->
+                    if (doc != null && doc.exists()) {
+                        if (cont.isActive) cont.resume(doc)
+                    } else {
+                        firestore.collection("conductores")
+                            .whereEqualTo("correo", cleanEmail)
+                            .limit(1)
+                            .get()
+                            .addOnSuccessListener { query ->
+                                val match = query.documents.firstOrNull()
+                                if (cont.isActive) cont.resume(match)
+                            }
+                            .addOnFailureListener {
+                                if (cont.isActive) cont.resume(null)
+                            }
+                    }
+                }
+                .addOnFailureListener {
+                    if (cont.isActive) cont.resume(null)
+                }
+        } catch (_: Exception) {
+            if (cont.isActive) cont.resume(null)
+        }
     }
 
     /**
@@ -182,6 +487,7 @@ class DriverRepository(
         profileDao.upsert(
             existing.copy(phoneVerified = true).toEntity()
         )
+        syncDriverToFirestore(accountId)
 
         // El codigo ya cumplio su funcion: se invalida.
         otpPrefs.edit().remove(otpKey(accountId)).apply()
@@ -231,7 +537,27 @@ class DriverRepository(
             )
         }
 
+        refreshVerificationStatus(vehicle.accountId)
+        syncDriverToFirestore(vehicle.accountId)
+
         return id
+    }
+
+    /**
+     * Asigna o cambia directamente la ruta donde trabaja el conductor
+     * para que se guarde en su vehiculo/perfil y se marque solo esa en el mapa.
+     */
+    suspend fun assignRoute(accountId: String, routeId: Int) {
+        val primary = getPrimaryVehicle(accountId)
+        if (primary != null) {
+            saveVehicle(primary.copy(transitVehicleId = routeId))
+        }
+        val currentShift = shiftDao.get(accountId)
+        if (currentShift != null) {
+            shiftDao.upsert(currentShift.copy(routeId = routeId))
+        }
+        refreshVerificationStatus(accountId)
+        syncDriverToFirestore(accountId)
     }
 
     suspend fun deleteVehicle(id: Long) =
@@ -256,27 +582,37 @@ class DriverRepository(
             .toSet()
 
     /**
-     * Sube un documento. Cada documento obligatorio que se sube mueve
-     * el perfil a "en revision"; cuando estan todos, la plataforma
-     * lo aprueba y el conductor puede trabajar.
+     * Sube un documento tras haber pasado la validacion de imagen y deteccion
+     * de rostro en vivo (para documentos biometricos). Cuando estan todos los
+     * documentos obligatorios aprobados y los datos del vehiculo/ruta completos,
+     * el conductor queda verificado automaticamente.
      */
     suspend fun uploadDocument(
         accountId: String,
         type: DriverDocumentType,
         filePath: String,
-        expiresAt: Long? = null
+        expiresAt: Long? = null,
+        note: String = "Documento verificado",
+        approved: Boolean = true
     ) {
+        val existing = documentDao.getForAccount(accountId)
+            .firstOrNull { it.type == type.name }
 
         documentDao.upsert(
             DriverDocumentEntity(
+                id = existing?.id ?: 0L,
                 accountId = accountId,
                 type = type.name,
                 filePath = filePath,
-                status = DriverDocumentStatus.UPLOADED.name,
-                note = "",
+                status = if (approved) {
+                    DriverDocumentStatus.APPROVED.name
+                } else {
+                    DriverDocumentStatus.UPLOADED.name
+                },
+                note = note,
                 expiresAt = expiresAt,
                 uploadedAt = System.currentTimeMillis(),
-                reviewedAt = null
+                reviewedAt = if (approved) System.currentTimeMillis() else null
             )
         )
 
@@ -373,7 +709,7 @@ class DriverRepository(
 
                 val vehicle = getPrimaryVehicle(accountId)
 
-                if (vehicle != null && vehicle.soatValid) {
+                if (vehicle != null && vehicle.soatValid && vehicle.transitVehicleId != null) {
                     DriverVerificationStatus.VERIFIED
                 } else {
                     DriverVerificationStatus.PENDING_REVIEW
@@ -394,6 +730,7 @@ class DriverRepository(
                 }
             ).toEntity()
         )
+        syncDriverToFirestore(accountId)
     }
 
     // =====================================================
@@ -439,7 +776,7 @@ class DriverRepository(
                 vehicleId = primary.id,
                 isOnline = true,
                 isOnTrip = false,
-                routeId = null,
+                routeId = primary.transitVehicleId,
                 startedAt = System.currentTimeMillis(),
                 lastLatitude = null,
                 lastLongitude = null,
@@ -464,6 +801,83 @@ class DriverRepository(
                 startedAt = null
             )
         )
+
+        // Al salir de servicio el conductor deja de estar asociado a la
+        // unidad: el pasajero no debe seguir viendolo ni un momento mas.
+        detachFromTransitVehicle(current)
+    }
+
+    /**
+     * Ruta a la que esta asignado el conductor ahora mismo.
+     *
+     * Se resuelve por el vehiculo principal o por el turno activo.
+     */
+    suspend fun getAssignedRouteId(accountId: String): Int? {
+        val primaryVehicle = getPrimaryVehicle(accountId)
+        val transitId = primaryVehicle?.transitVehicleId
+            ?: shiftDao.get(accountId)?.routeId
+            ?: return null
+
+        return transitVehicleDao.getById(transitId)?.routeId ?: transitId
+    }
+
+    /**
+     * Trazado de la ruta asignada, en orden. Vacio si el conductor
+     * todavia no tiene ruta: en ese caso no hay nada que vigilar.
+     */
+    suspend fun getAssignedRoutePoints(accountId: String): List<GeoPoint> {
+
+        val routeId = getAssignedRouteId(accountId) ?: return emptyList()
+
+        val cloudRoute = com.ejemplo.smartbus.data.FirebaseRouteRepository.routes.value
+            .firstOrNull { it.id == routeId }
+            ?: com.ejemplo.smartbus.data.RouteRepository.routes
+                .firstOrNull { it.id == routeId }
+
+        if (cloudRoute != null) {
+            val combined = (cloudRoute.subidaPoints + cloudRoute.bajadaPoints)
+                .ifEmpty { cloudRoute.points }
+            if (combined.isNotEmpty()) {
+                return combined
+            }
+        }
+
+        return routePointDao.getForRoute(routeId).map { point ->
+            GeoPoint(
+                latitude = point.latitude,
+                longitude = point.longitude
+            )
+        }
+    }
+
+    /**
+     * Desasocia al conductor de su unidad de transporte.
+     *
+     * Se llama al terminar el servicio y tambien cuando el conductor se
+     * desvia tanto que dejamos de publicar su posicion. La unidad queda
+     * libre para que el operador (o el simulador) la vuelva a usar.
+     */
+    private suspend fun detachFromTransitVehicle(
+        shift: com.ejemplo.smartbus.data.db.DriverShiftEntity
+    ) {
+        // Eliminar vehiculo en vivo de Firestore al salir de servicio
+        try {
+            val firestore = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+            firestore.collection("vehiculos_en_vivo").document(shift.accountId).delete()
+        } catch (_: Exception) {
+        }
+
+        val driverVehicleId = shift.vehicleId ?: return
+
+        val driverVehicle = vehicleDao.getById(driverVehicleId) ?: return
+
+        val transitId = driverVehicle.transitVehicleId ?: return
+
+        try {
+            transitVehicleDao.clearLivePosition(transitId)
+        } catch (exception: Exception) {
+            Log.w(TAG, "No se pudo soltar la unidad: ${exception.message}")
+        }
     }
 
 /**
@@ -510,7 +924,7 @@ class DriverRepository(
      * Sin esto el conductor comparte GPS pero el pasajero no lo ve,
      * porque el mapa lee de la tabla de vehiculos y no de los turnos.
      * Solo se escribe si el vehiculo esta enlazado a una unidad de
-     * transito: un vehiculo sin asignar no tiene donde dibujarse.
+     * transito y TODOS los requisitos de seguridad estan cumplidos.
      */
     private suspend fun mirrorPositionToTransit(
         accountId: String,
@@ -524,6 +938,7 @@ class DriverRepository(
         try {
 
             val shift = shiftDao.get(accountId) ?: return
+            if (!shift.isOnline) return
 
             val driverVehicleId = shift.vehicleId ?: return
 
@@ -531,7 +946,15 @@ class DriverRepository(
 
             val transitId = driverVehicle.transitVehicleId ?: return
 
-            val profile = profileDao.get(accountId)
+            val profile = profileDao.get(accountId) ?: return
+
+            // Puerta de seguridad estricta: si falta cualquier documento obligatorio,
+            // rostro en vivo, SOAT o ruta, NO se conecta ni transmite al pasajero.
+            val approvedTypes = getApprovedDocumentTypes(accountId)
+            if (!DriverValidators.canGoOnline(profile.toModel(), driverVehicle.toModel(), approvedTypes)) {
+                detachFromTransitVehicle(shift)
+                return
+            }
 
             val plate = driverVehicle.plate
 
@@ -545,12 +968,39 @@ class DriverRepository(
                 isMock = false,
                 plate = plate,
                 plateCount = lastDigitsOf(plate),
-                driverName = profile?.fullName.orEmpty(),
+                driverName = profile.fullName,
                 capacity = driverVehicle.capacity,
                 occupancy = null,
                 status = if (shift.isOnTrip) "EN_RUTA" else "EN_SERVICIO",
                 lastUpdate = System.currentTimeMillis()
             )
+
+            // Publicar ubicacion en tiempo real en Firebase Firestore para que los pasajeros la vean
+            try {
+                val firestore = com.google.firebase.firestore.FirebaseFirestore.getInstance()
+                val liveVehicleData = hashMapOf(
+                    "conductorId" to accountId,
+                    "correo" to profile.email,
+                    "driverName" to profile.fullName,
+                    "plate" to plate,
+                    "plateCount" to lastDigitsOf(plate),
+                    "routeId" to transitId,
+                    "latitude" to latitude,
+                    "longitude" to longitude,
+                    "latitud" to latitude,
+                    "longitud" to longitude,
+                    "speedKmh" to speedKmh,
+                    "headingDegrees" to (headingDegrees ?: 0f),
+                    "tripType" to (if (shift.isOnTrip) "SUBIDA" else "BAJADA"),
+                    "status" to (if (shift.isOnTrip) "EN_RUTA" else "EN_SERVICIO"),
+                    "capacity" to driverVehicle.capacity,
+                    "isMock" to false,
+                    "lastUpdate" to System.currentTimeMillis()
+                )
+                firestore.collection("vehiculos_en_vivo").document(accountId).set(liveVehicleData)
+            } catch (e: Exception) {
+                Log.w(TAG, "Error al sincronizar vehiculos_en_vivo con Firestore: ${e.message}")
+            }
 
         } catch (exception: Exception) {
             Log.w(TAG, "No se pudo actualizar el vehiculo: ${exception.message}")
@@ -636,9 +1086,12 @@ class DriverRepository(
 private fun DriverProfileEntity.toModel() =
     DriverProfile(
         accountId = accountId,
+        email = email,
         fullName = fullName,
         documentId = documentId,
         documentType = documentType,
+        companyName = companyName,
+        companyCode = companyCode,
         birthDate = birthDate,
         phone = phone,
         phoneVerified = phoneVerified,
@@ -659,9 +1112,12 @@ private fun DriverProfileEntity.toModel() =
 private fun DriverProfile.toEntity() =
     DriverProfileEntity(
         accountId = accountId,
+        email = email,
         fullName = fullName,
         documentId = documentId,
         documentType = documentType,
+        companyName = companyName,
+        companyCode = companyCode,
         birthDate = birthDate,
         phone = phone,
         phoneVerified = phoneVerified,

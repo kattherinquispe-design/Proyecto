@@ -41,12 +41,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.ejemplo.smartbus.data.driver.DriverRequirements
 import com.ejemplo.smartbus.data.driver.DriverStep
+import com.ejemplo.smartbus.data.driver.FaceDetectionValidator
 import com.ejemplo.smartbus.data.model.DriverDocument
 import com.ejemplo.smartbus.data.model.DriverDocumentStatus
 import com.ejemplo.smartbus.data.model.DriverDocumentType
 import com.ejemplo.smartbus.ui.theme.SmartBusBackground
+import com.ejemplo.smartbus.ui.theme.AppPalette
+import com.ejemplo.smartbus.ui.theme.SmartBusDisplay
+import com.ejemplo.smartbus.ui.theme.SmartBusBody
+import androidx.compose.material3.ButtonDefaults
 import com.ejemplo.smartbus.ui.theme.SmartBusBlue
 import com.ejemplo.smartbus.ui.theme.SmartBusDivider
 import com.ejemplo.smartbus.ui.theme.SmartBusGreen
@@ -70,6 +76,7 @@ fun DriverDocumentsScreen(
     onUpload: (DriverDocumentType) -> Unit,
     onDelete: (DriverDocumentType) -> Unit,
     onBack: () -> Unit,
+    onFinish: () -> Unit = onBack,
     modifier: Modifier = Modifier
 ) {
 
@@ -108,7 +115,7 @@ fun DriverDocumentsScreen(
             }
 
             Text(
-                text = "Documentos para conducir",
+                text = "Documentos y Verificación Biométrica",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
                 color = SmartBusText
@@ -117,8 +124,7 @@ fun DriverDocumentsScreen(
             Spacer(modifier = Modifier.height(4.dp))
 
             Text(
-                text = "La plataforma revisa cada documento. Solo con todos " +
-                    "aprobados y el SOAT vigente puedes ponerte en servicio.",
+                text = "Por tu seguridad y la de los pasajeros, no podrás conectarte sin todos los documentos verificados y detección de rostro en vivo. Solo se hace una vez y queda guardado en tu cuenta.",
                 style = MaterialTheme.typography.bodySmall,
                 color = SmartBusTextSecondary
             )
@@ -136,6 +142,22 @@ fun DriverDocumentsScreen(
                 color = if (completed == total) SmartBusGreen else SmartBusBlue,
                 trackColor = SmartBusDivider
             )
+
+            if (completed == total && total > 0) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Button(
+                    onClick = onFinish,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = SmartBusGreen)
+                ) {
+                    Text(
+                        "✅ Documentación completa y guardada — Ir al mapa",
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+            }
         }
 
         LazyColumn(
@@ -261,17 +283,27 @@ private fun DocumentRow(
                         color = SmartBusTextSecondary
                     )
 
+                    if (FaceDetectionValidator.requiresLiveFaceDetection(type)) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "🔒 Requiere detección de rostro humano en vivo (solo cámara)",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = SmartBusBlue
+                        )
+                    }
+
                     if (document != null && document.note.isNotBlank()) {
 
                         Spacer(modifier = Modifier.height(4.dp))
 
                         Text(
-                            text = "Nota del revisor: ${document.note}",
+                            text = document.note,
                             style = MaterialTheme.typography.bodySmall,
                             color = if (status == DriverDocumentStatus.REJECTED) {
                                 SmartBusRed
                             } else {
-                                SmartBusTextSecondary
+                                SmartBusGreen
                             }
                         )
                     }
@@ -289,37 +321,71 @@ private fun DocumentRow(
 
                     Spacer(modifier = Modifier.height(6.dp))
 
-                    Row {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
 
                         if (document == null) {
 
-                            TextButton(onClick = onUpload) {
+                            Button(
+                                onClick = onUpload,
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppPalette.primary)
+                            ) {
                                 Icon(
                                     Icons.Default.AddAPhoto,
                                     contentDescription = null,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Subir")
+                                Text(
+                                    if (FaceDetectionValidator.requiresLiveFaceDetection(type)) {
+                                        "📷 Capturar rostro en vivo"
+                                    } else {
+                                        "📷 Subir / Capturar documento"
+                                    },
+                                    fontSize = 12.sp,
+                                    fontFamily = SmartBusDisplay,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
 
                         } else if (status == DriverDocumentStatus.REJECTED) {
 
-                            TextButton(onClick = onUpload) {
-                                Text("Volver a subir")
+                            Button(
+                                onClick = onUpload,
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = AppPalette.primary)
+                            ) {
+                                Text("Volver a capturar foto", fontSize = 12.sp)
                             }
 
+                            Spacer(modifier = Modifier.width(8.dp))
+
                             TextButton(onClick = onDelete) {
-                                Text("Quitar")
+                                Text("Quitar", color = SmartBusRed, fontSize = 12.sp)
                             }
 
                         } else {
 
-                            Text(
-                                text = status.label,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = statusColor(status)
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = null,
+                                    tint = SmartBusGreen,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = if (status == DriverDocumentStatus.APPROVED) "✅ Verificado y guardado" else "⏳ Foto capturada",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = statusColor(status)
+                                )
+                                TextButton(onClick = onUpload) {
+                                    Text("Actualizar", fontSize = 11.sp, color = SmartBusBlue)
+                                }
+                            }
                         }
                     }
                 }
